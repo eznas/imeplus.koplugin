@@ -18,19 +18,19 @@ local function isPinyin(ime)
 end
 
 -- imeplus: fuzzy pinyin rules (applied both ways at query time, no extra memory)
+-- Only the retroflex/flat initial pairs; nasal and final confusions are left out
+-- (they merged too many unrelated candidates).
 local FUZZY = {
     { "zh", "z" },
     { "ch", "c" },
     { "sh", "s" },
-    { "n", "l" },
-    { "an", "ang" },
-    { "en", "eng" },
-    { "in", "ing" },
 }
 local FUZZY_BOTH = {}
+local RETROFLEX = {} -- flat initial -> full retroflex initial (z -> zh, ...)
 for _, rule in ipairs(FUZZY) do
     FUZZY_BOTH[#FUZZY_BOTH+1] = { rule[1], rule[2] }
     FUZZY_BOTH[#FUZZY_BOTH+1] = { rule[2], rule[1] }
+    RETROFLEX[rule[2]] = rule[1]
 end
 local FUZZY_MAX_VARIANTS = 16
 
@@ -39,6 +39,64 @@ local function fuzzy_enabled()
         return G_reader_settings:readSetting("imeplus_fuzzy", true)
     end
     return true
+end
+
+-- imeplus: self-learned words. A word committed once (typed fully or selected)
+-- afterwards surfaces under its initials/loose code ("jiazai" once -> "jz" finds
+-- 加载). Stored in G_reader_settings("imeplus_user_words"), persisted at exit.
+local USER_WORDS_MAX = 200
+local USER_CANDI_MAX = 8
+
+local function learn_enabled()
+    if G_reader_settings then
+        return G_reader_settings:readSetting("imeplus_learn", true)
+    end
+    return false
+end
+
+-- Abbreviation match: the typed code is a first-letter-anchored subsequence of
+-- the learned full pinyin ("jz" ~ "jiazai", "zhch" ~ "zhichi"). Three guards
+-- keep partial/misspelled full pinyin out of the abbreviation pool:
+--   * a plain prefix ("zh" for "zhichi") is only an abbreviation once it has
+--     crossed the first syllable ("shenm"/"huoz" yes, "zh"/"gong" no);
+--   * the second letter must be a consonant (either the next syllable's initial
+--     or the "h" of zh/ch/sh) — a vowel there means the first syllable carries
+--     rhyme, i.e. a broken full pinyin ("xuxi" for "xuexi"), not initials;
+--   * the last match must land at position >= 3 (letters all inside the first
+--     syllable, incl. words learned from a fuzzy typo "zichi" -> 支持).
+-- imeplus: does a pure-prefix code reach PAST the first syllable? A stock table
+-- key strictly shorter than the code marks a syllable boundary ("shen" in
+-- "shenm", "huo" in "huoz", "zhi" in "zhic"); codes still inside syllable 1
+-- ("zh", "gong", "bei") are partial spellings, not abbreviations. No new data:
+-- the stock pinyin table already contains every full syllable as a key.
+-- ponytail: zero-initial syllables ("ayi") can't be abbreviated this way.
+local function crossedFirstSyllable(code, code_map)
+    for i = 2, #code - 1 do
+        if code_map[code:sub(1, i)] then return true end
+    end
+    return false
+end
+
+local function looseMatch(code, learned, code_map)
+    if #code < 2 or #code > #learned then return false end
+    if code:byte(1) ~= learned:byte(1) then return false end
+    local is_prefix = learned:sub(1, #code) == code
+    if is_prefix then
+        -- a pure prefix is a valid abbreviation only past syllable 1
+        return crossedFirstSyllable(code, code_map)
+    end
+    local second = code:byte(2)
+    if second == 97 or second == 101 or second == 105 or second == 111
+        or second == 117 or second == 118 then return false end -- a/e/i/o/u/v
+    local i, last_pos = 2, 1
+    for j = 2, #learned do
+        if code:byte(i) == learned:byte(j) then
+            last_pos = j
+            i = i + 1
+            if i > #code then return last_pos >= 3 end
+        end
+    end
+    return false
 end
 
 -- imeplus: expand code into fuzzy variants (BFS over rule applications, capped & deduped)
@@ -173,6 +231,9 @@ end
 
 function IME:init()
     self:clear_stack()
+
+    -- imeplus: self-learned words (shared store, loaded per keyboard session)
+    self.user_words = (G_reader_settings and G_reader_settings:readSetting("imeplus_user_words")) or {}
 
     self.sorted_codes = {}
     for k,_ in pairs(self.code_map) do
@@ -314,10 +375,32 @@ function IME:getCandidates(code)
         end
     end
     -- no wildcard
-    if isPinyin(self) and fuzzy_enabled() then
-        local merged = self:getMergedCandidates(code)
-        if #merged > 0 then return merged end
-        return
+    if isPinyin(self) then
+        if fuzzy_enabled() then
+            local merged = self:getMergedCandidates(code)
+            if #merged > 0 then return merged end
+            return
+        end
+        -- fuzzy off: exact hits first, then learned words, stock prefix search last
+        local exact = self:getCandiFromMap(code)
+        local user = self:getUserCandi(code)
+        if exact or user then
+            local merged, seen = {}, {}
+            local function add(list)
+                if type(list) == "string" then list = { list } end
+                if list then
+                    for _, v in ipairs(list) do
+                        if not seen[v] then
+                            seen[v] = true
+                            merged[#merged+1] = v
+                        end
+                    end
+                end
+            end
+            add(exact)
+            add(user)
+            return merged
+        end
     end
     return self:getCandiFromMap(code) or self:searchStartWith(code)
 end
@@ -338,6 +421,7 @@ function IME:getMergedCandidates(code)
         end
     end
     addCandi(self:getCandiFromMap(code))
+    addCandi(self:getUserCandi(code)) -- learned words rank after exact hits, before variants
     local variants = fuzzy_variants(code)
     for _, v in ipairs(variants) do
         addCandi(self:getCandiFromMap(v))
@@ -348,6 +432,71 @@ function IME:getMergedCandidates(code)
         addCandi(self:searchStartWith(v))
     end
     return merged
+end
+
+-- imeplus: learned-word candidates for a typed code, ranked by usage count.
+-- ponytail: no fuzzy-variant scan here — the abbreviation spellings users type
+-- ("zhch"/"zc"/"zhc"/"zch" for "zhichi") already are subsequences of the learned
+-- code, while fuzzy elongation variants ("zh" -> "zhh") would wrongly resurrect
+-- plain first-syllable prefixes as abbreviations.
+function IME:getUserCandi(code)
+    if #code < 2 or #self.user_words == 0 then return nil end
+    local matched = {}
+    for _, e in ipairs(self.user_words) do
+        -- ponytail: with fuzzy off, a flat initial ("s" in "sm") must not stand
+        -- in for a learned retroflex initial ("sh" in "shenme") — that is a
+        -- fuzzy spelling, not a real abbreviation. With fuzzy on, both pass.
+        local allowed = true
+        if not fuzzy_enabled() then
+            local flat = code:sub(1, 1)
+            local retro = RETROFLEX[flat]
+            if retro and code:sub(2, 2) ~= "h" and e.c:sub(1, #retro) == retro then
+                allowed = false
+            end
+        end
+        if allowed and looseMatch(code, e.c, self.code_map) then matched[#matched+1] = e end
+    end
+    if #matched == 0 then return nil end
+    table.sort(matched, function(a, b) return a.n > b.n end)
+    local out = {}
+    for i = 1, math.min(#matched, USER_CANDI_MAX) do
+        out[i] = matched[i].w
+    end
+    return out
+end
+
+function IME:saveUserWords()
+    if G_reader_settings then
+        G_reader_settings:saveSetting("imeplus_user_words", self.user_words)
+    end
+end
+
+-- imeplus: record a committed word together with the code it was typed under
+-- (called from separate(), i.e. on space commit / digit selection / flush)
+function IME:learnWord(word, code)
+    if not isPinyin(self) or not learn_enabled() then return end
+    local chars = util.splitToChars(word)
+    if #chars < 2 then return end -- single chars and empty flushes don't learn
+    for _, ch in ipairs(chars) do
+        if ch:byte(1) < 0xE0 then return end -- pure CJK words only
+    end
+    if #code < 2 or #code > 6 * #chars then return end -- plausible full-pinyin length
+    for _, e in ipairs(self.user_words) do
+        if e.w == word then
+            e.n = e.n + 1
+            if #code > #e.c then e.c = code end -- keep the most complete code seen
+            self:saveUserWords()
+            return
+        end
+    end
+    self.user_words[#self.user_words+1] = { w = word, c = code, n = 1 }
+    if #self.user_words > USER_WORDS_MAX then
+        table.sort(self.user_words, function(a, b) return a.n > b.n end)
+        for i = USER_WORDS_MAX + 1, #self.user_words do
+            self.user_words[i] = nil
+        end
+    end
+    self:saveUserWords()
 end
 
 
@@ -445,6 +594,15 @@ end
 function IME:separate(inputbox)
     if self.hint_char_count then
         self:delHintChars(inputbox)
+    end
+    -- imeplus: commit point — learn the staged word with the code typed for it
+    if isPinyin(self) and #_stack > 0 then
+        local word, code = "", ""
+        for i = 1, #_stack do
+            word = word .. _stack[i].char
+            code = code .. _stack[i].code
+        end
+        self:learnWord(word, code)
     end
     self:clear_stack()
 end

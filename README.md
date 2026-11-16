@@ -1,7 +1,7 @@
 # imeplus.koplugin — 拼音输入增强 / Pinyin IME enhancement for KOReader
 
-让 KOReader 内置拼音输入法好用起来：候选带数字编号、数字键选字、←/→ 翻页、模糊拼音、按输入框宽度自适应候选数。
-Makes the built-in KOReader pinyin IME actually usable: numbered candidate window, digit selection, ←/→ paging, fuzzy pinyin, and width-aware candidate count.
+让 KOReader 内置拼音输入法好用起来：候选带数字编号、数字键选字、←/→ 翻页、模糊拼音、按输入框宽度自适应候选数、记忆常用词（简拼）。
+Makes the built-in KOReader pinyin IME actually usable: numbered candidate window, digit selection, ←/→ paging, fuzzy pinyin, width-aware candidate count, and self-learned abbreviations.
 
 纯插件实现（`require` 接管 + 引擎副本），**不修改任何系统文件**，删目录即卸载。
 Pure plugin (engine takeover via `package.preload`), **touches no system files** — delete the folder to uninstall.
@@ -11,11 +11,12 @@ Pure plugin (engine takeover via `package.preload`), **touches no system files**
 - **候选窗口**：舞台字 + `[2你 3尼 …9倪]` 数字编号候选，最多 9 个/页
 - **数字选字**：组合中按 1-9 上屏对应候选；超出可见范围的数字按字面上屏
 - **←/→ 翻页**：整页翻动，首尾回绕；空格上屏当前页首选
-- **模糊拼音**：zh↔z、ch↔c、sh↔s、n↔l、an↔ang、en↔eng、in↔ing，查询时变体展开 + 候选合并（原码永远排最前）；菜单可开关
+- **模糊拼音**：只做 zh↔z、ch↔c、sh↔s 三对翘/平舌声母，查询时变体展开 + 候选合并（原码永远排最前）；鼻音与前后鼻韵母不模糊（合并无关候选太多）；菜单可开关
 - **宽度自适应**：多字词候选按输入框实际宽度动态缩减数量，行首不被滚动裁掉
-- **零内存增量**：模糊拼音为查询时字符串展开（≤16 变体），无持久化、无新控件
+- **记忆常用词（简拼）**：上屏过的词会被记住，之后可用声母缩写打出。例如完整输入 `jiazai` 上屏「加载」一次，以后打 `jz` 即出；打过 `zhichi` 后，`zhch`/`zc`/`zhc`/`zch` 都能找到「支持」。词按使用次数排序，最多存 200 条（存于 `settings.reader.lua`，无额外文件）；`zh` 这类首音节前缀不算简拼（原生前缀搜索照常工作）。菜单可开关、可清空
+- **零词库增量**：模糊拼音与记忆词均为查询时计算，无新词库文件、无新控件
 
-菜单入口：`工具 → 更多工具 → 拼音输入增强`（模糊拼音开关 / 关于）。
+菜单入口：`工具 → 更多工具 → 拼音输入增强`（模糊拼音 / 记忆常用词开关、清空记忆词、关于）。
 
 ## 安装 / Install
 

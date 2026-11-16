@@ -1,5 +1,5 @@
 --[[
-imeplus.koplugin — 拼音输入增强：数字选字 / ←/→ 翻页 / 模糊拼音
+imeplus.koplugin — 拼音输入增强：数字选字 / ←/→ 翻页 / 模糊拼音 / 记忆常用词（简拼）
 
 接管方式：启动时把 require("ui/data/keyboardlayouts/generic_ime") 重定向到插件自带的
 引擎副本 ime_engine.lua（stock v2025.10 快照 + 功能补丁），系统文件零改动。
@@ -95,10 +95,32 @@ function ImePlus:addToMainMenu(menu_items)
                 keep_menu_open = true,
             },
             {
+                text = _("记忆常用词"),
+                checked_func = function()
+                    return G_reader_settings:readSetting("imeplus_learn", true)
+                end,
+                callback = function()
+                    local new_value = not G_reader_settings:readSetting("imeplus_learn", true)
+                    G_reader_settings:saveSetting("imeplus_learn", new_value)
+                end,
+                keep_menu_open = true,
+            },
+            {
+                text = _("清空记忆词"),
+                callback = function()
+                    G_reader_settings:saveSetting("imeplus_user_words", {})
+                    UIManager:show(InfoMessage:new{
+                        text = _("已清空记忆词。上屏过的词不再参与简拼候选。"),
+                        timeout = 3,
+                    })
+                end,
+                keep_menu_open = true,
+            },
+            {
                 text = _("关于"),
                 callback = function()
                     UIManager:show(InfoMessage:new{
-                        text = _("拼音输入增强已接管内置输入法引擎：候选 9 个带数字编号，数字键选字，←/→ 翻页，空格上屏。模糊拼音可在上方开关。"),
+                        text = _("拼音输入增强已接管内置输入法引擎：候选 9 个带数字编号，数字键选字，←/→ 翻页，空格上屏。上屏过的词会被记住，之后可用声母简拼打出（如完整输入 jiazai 一次后，jz 即出 加载）。模糊拼音与记忆词可在上方开关。"),
                         timeout = 10,
                     })
                 end,
