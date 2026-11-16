@@ -17,21 +17,23 @@ local function isPinyin(ime)
     return ime.switch_char == "→"
 end
 
--- imeplus: fuzzy pinyin rules (applied both ways at query time, no extra memory)
--- Only the retroflex/flat initial pairs; nasal and final confusions are left out
--- (they merged too many unrelated candidates).
-local FUZZY = {
-    { "zh", "z" },
-    { "ch", "c" },
-    { "sh", "s" },
+-- imeplus: selectable fuzzy pinyin rules. Only the three retroflex/flat pairs
+-- are on by default; the rest are opt-in from the plugin menu. Exported on the
+-- IME table so main.lua builds the menu from the same list (single source).
+local FUZZY_PRESETS = {
+    { id = "zh_z",   from = "zh",  to = "z",   label = "zh / z",   default = true },
+    { id = "ch_c",   from = "ch",  to = "c",   label = "ch / c",   default = true },
+    { id = "sh_s",   from = "sh",  to = "s",   label = "sh / s",   default = true },
+    { id = "n_l",    from = "n",   to = "l",   label = "n / l" },
+    { id = "l_r",    from = "l",   to = "r",   label = "l / r" },
+    { id = "an_ang", from = "an",  to = "ang", label = "an / ang" },
+    { id = "en_eng", from = "en",  to = "eng", label = "en / eng" },
+    { id = "in_ing", from = "in",  to = "ing", label = "in / ing" },
+    { id = "f_h",    from = "f",   to = "h",   label = "f / h" },
 }
-local FUZZY_BOTH = {}
-local RETROFLEX = {} -- flat initial -> full retroflex initial (z -> zh, ...)
-for _, rule in ipairs(FUZZY) do
-    FUZZY_BOTH[#FUZZY_BOTH+1] = { rule[1], rule[2] }
-    FUZZY_BOTH[#FUZZY_BOTH+1] = { rule[2], rule[1] }
-    RETROFLEX[rule[2]] = rule[1]
-end
+-- ponytail: these three are pinyin facts (flat vs retroflex initials), used by
+-- the abbreviation gate regardless of which fuzzy rules the user enabled.
+local RETROFLEX = { z = "zh", c = "ch", s = "sh" }
 local FUZZY_MAX_VARIANTS = 16
 
 local function fuzzy_enabled()
@@ -39,6 +41,24 @@ local function fuzzy_enabled()
         return G_reader_settings:readSetting("imeplus_fuzzy", true)
     end
     return true
+end
+
+-- imeplus: build the bidirectional rule list from the settings map.
+-- nil map = defaults (3 retroflex pairs on); an existing map is authoritative,
+-- so rules absent from it are OFF (the menu writes every toggle explicitly).
+local function activeFuzzyRules()
+    local saved = G_reader_settings and G_reader_settings:readSetting("imeplus_fuzzy_rules")
+    local rules = {}
+    for _, p in ipairs(FUZZY_PRESETS) do
+        local on
+        if saved then on = saved[p.id] == true
+        else on = p.default == true end
+        if on then
+            rules[#rules+1] = { p.from, p.to }
+            rules[#rules+1] = { p.to, p.from }
+        end
+    end
+    return rules
 end
 
 -- imeplus: self-learned words. A word committed once (typed fully or selected)
@@ -100,13 +120,14 @@ local function looseMatch(code, learned, code_map)
 end
 
 -- imeplus: expand code into fuzzy variants (BFS over rule applications, capped & deduped)
-local function fuzzy_variants(code)
+local function fuzzy_variants(code, rules)
+    rules = rules or activeFuzzyRules()
     local variants = {}
     local seen = { [code] = true }
     local queue = { code }
     while #queue > 0 and #variants < FUZZY_MAX_VARIANTS do
         local s = table.remove(queue)
-        for _, rule in ipairs(FUZZY_BOTH) do
+        for _, rule in ipairs(rules) do
             local from, to = rule[1], rule[2]
             local pos = 1
             while true do
@@ -218,7 +239,9 @@ local IME = {
     local_del = "",  -- default
     has_case = false,
     exact_match = false,
-    W = nil -- default no wildcard
+    W = nil, -- default no wildcard
+    -- imeplus: exported for main.lua to build the fuzzy-rule submenu
+    fuzzy_presets = FUZZY_PRESETS,
 }
 
 function IME:new(new_o)
@@ -232,8 +255,30 @@ end
 function IME:init()
     self:clear_stack()
 
-    -- imeplus: self-learned words (shared store, loaded per keyboard session)
-    self.user_words = (G_reader_settings and G_reader_settings:readSetting("imeplus_user_words")) or {}
+    -- imeplus: self-learned words (shared store, loaded per keyboard session).
+    -- Scrub broken multi-frame learning artifacts ("没有钱没有钱" = X..X).
+    local raw = (G_reader_settings and G_reader_settings:readSetting("imeplus_user_words")) or {}
+    local had_junk = false
+    self.user_words = {}
+    for _, e in ipairs(raw) do
+        local n_chars = #util.splitToChars(e.w or "")
+        local half = n_chars % 2 == 0
+        if half then
+            local chars = util.splitToChars(e.w)
+            half = true
+            for i = 1, n_chars / 2 do
+                if chars[i] ~= chars[i + n_chars / 2] then half = false break end
+            end
+        end
+        if half then
+            had_junk = true -- doubled word: drop it from the store entirely
+        else
+            self.user_words[#self.user_words+1] = e
+        end
+    end
+    if had_junk then self:saveUserWords() end
+
+    self:loadCustomWords()
 
     self.sorted_codes = {}
     for k,_ in pairs(self.code_map) do
@@ -258,6 +303,106 @@ function IME:init()
             self.iter_map[keys[#keys]] = keys[1]
         end
     end
+
+    self:loadCustomWords()
+end
+
+-- imeplus: custom phrase table (plugins/imeplus.koplugin/custom_words.lua).
+-- Each entry is either a word string (its full pinyin is looked up character by
+-- character in the stock table) or a { word, code } pair giving the word's own
+-- input code ("一闪一闪亮晶晶 ysys"). An explicit code is matched verbatim
+-- (getExactLearned/promotion), so it need not be a valid pinyin spelling. When
+-- the code is omitted, the word's INITIALS are generated automatically (first
+-- letters of each syllable: zh/ch/sh keep both letters). Custom words are NOT
+-- ranked apart: they inherit the usage count of the same word in the learned
+-- store (or start at 0), so all candidates are ordered by real usage frequency.
+-- Missing/ill-formed file is simply ignored.
+function IME:loadCustomWords()
+    if not isPinyin(self) then return end
+    local ok, entries = pcall(dofile, "plugins/imeplus.koplugin/custom_words.lua")
+    if not ok or type(entries) ~= "table" then return end
+
+    -- single char -> its shortest pinyin code from the stock table
+    local char_code = {}
+    for code, list in pairs(self.code_map) do
+        if #code > 0 then
+            local words = type(list) == "string" and { list } or list
+            for _, w in ipairs(words) do
+                if util.splitToChars(w) and #util.splitToChars(w) == 1 and not char_code[w] then
+                    char_code[w] = code
+                end
+            end
+        end
+    end
+
+        -- initials of the word's syllables ("一闪一闪亮晶晶" -> "ysysljj")
+    local function lookupInitials(w)
+        local out = {}
+        for _, ch in ipairs(util.splitToChars(w)) do
+            local c = char_code[ch]
+            if not c or not c:match("^[a-z]+$") then return nil end
+            if c:sub(1, 2) == "zh" or c:sub(1, 2) == "ch" or c:sub(1, 2) == "sh" then
+                out[#out+1] = c:sub(1, 2)
+            else
+                out[#out+1] = c:sub(1, 1)
+            end
+        end
+        return table.concat(out)
+    end
+
+    -- explicit codes are matched verbatim, so they bypass the abbreviation
+    -- guards (a code like "ysys" is not a prefix of a real pinyin spelling)
+    if not self.custom_codes then self.custom_codes = {} end
+
+    local by_word = {}
+    for _, e in ipairs(self.user_words) do
+        by_word[e.w] = e
+        -- persisted entries that carry an explicit code rebuild the verbatim map
+        if e.explicit then
+            if not self.custom_codes then self.custom_codes = {} end
+            self.custom_codes[e.c] = e
+        end
+    end
+    for _, e in ipairs(entries) do
+        local w, explicit
+        if type(e) == "string" then
+            -- tolerate "word code" written as one string (hand-edited files)
+            w = e:match("^(%S+)$") or e:match("^(%S+)%s+%S+$")
+            explicit = e:match("^%S+%s+(%S+)$")
+        elseif type(e) == "table" and type(e[1]) == "string" then
+            w, explicit = e[1], e[2]
+        end
+        if w and not by_word[w] then
+            local has_cjk = w:match("[\xE4-\xE9\xEA-\xEF]") ~= nil
+            local n_chars = #util.splitToChars(w)
+            -- Pure CJK words need >=2 chars and can auto-generate initials.
+            -- ASCII words and MIXED words (K8手机壳, iPhone13手机) contain
+            -- non-pinyin characters, so they REQUIRE an explicit code.
+            local pure_cjk = has_cjk
+            if pure_cjk then
+                for i = 1, #w do
+                    if w:byte(i) < 0x80 then pure_cjk = false break end
+                end
+            end
+            local ok_len = (pure_cjk and n_chars >= 2)
+                or (not pure_cjk and #w >= 2 and explicit)
+            if ok_len then
+                local c = explicit
+                if not c and pure_cjk then
+                    c = lookupInitials(w)
+                end
+                -- codes may contain digits ("K8手机壳 k8sjk"); digit keys inside a
+                -- custom-code prefix are swallowed into the composition (see
+                -- wrappedAddChars), so they never trigger candidate selection
+                if c and c:match("^[a-z0-9]+$") then
+                    local entry = { w = w, c = c, n = 0, explicit = explicit ~= nil }
+                    self.user_words[#self.user_words+1] = entry
+                    by_word[w] = entry
+                    self.custom_codes[c] = entry
+                end
+            end
+        end
+    end
 end
 
 function IME:clear_stack()
@@ -266,6 +411,7 @@ function IME:clear_stack()
     self.last_index = 0
     self.hint_char_count = 0
     self.on_stage_char_count = 0
+    self.v_text = nil -- imeplus: "v" english passthrough buffer
 end
 
 function IME:reset_status()
@@ -376,15 +522,24 @@ function IME:getCandidates(code)
     end
     -- no wildcard
     if isPinyin(self) then
+        -- explicit custom codes ("一闪一闪亮晶晶 ysys") are typed letter by letter;
+        -- a typed prefix of one must keep the composition alive (an intermediate
+        -- prefix without stock candidates would otherwise break the stack). BUT a
+        -- short prefix may also be a valid pinyin code ("ai" for 爱 while "ai1"
+        -- is being typed): query normally first, and only return the empty
+        -- keep-alive table when the stock/memory pools have nothing to show.
+        local keep_composition = self:isCustomCodePrefix(code) and not self.custom_codes[code]
         if fuzzy_enabled() then
             local merged = self:getMergedCandidates(code)
             if #merged > 0 then return merged end
+            if keep_composition then return {} end
             return
         end
-        -- fuzzy off: exact hits first, then learned words, stock prefix search last
+        -- fuzzy off: learned habit first, then stock exact hits, then abbreviations
+        local promoted = self:getExactLearned(code)
         local exact = self:getCandiFromMap(code)
         local user = self:getUserCandi(code)
-        if exact or user then
+        if promoted or exact or user then
             local merged, seen = {}, {}
             local function add(list)
                 if type(list) == "string" then list = { list } end
@@ -397,10 +552,12 @@ function IME:getCandidates(code)
                     end
                 end
             end
+            add(promoted)
             add(exact)
             add(user)
             return merged
         end
+        if keep_composition then return {} end
     end
     return self:getCandiFromMap(code) or self:searchStartWith(code)
 end
@@ -420,18 +577,86 @@ function IME:getMergedCandidates(code)
             end
         end
     end
+    addCandi(self:getExactLearned(code)) -- habit wins over the stock table order
     addCandi(self:getCandiFromMap(code))
-    addCandi(self:getUserCandi(code)) -- learned words rank after exact hits, before variants
+    local user, user_matched = self:getUserCandi(code)
+    addCandi(user) -- learned words rank after exact hits, before variants
     local variants = fuzzy_variants(code)
     for _, v in ipairs(variants) do
         addCandi(self:getCandiFromMap(v))
     end
-    if #merged > 0 then return merged end
-    addCandi(self:searchStartWith(code))
+    if #merged > 0 then
+        -- learned/abbreviation hits lead the pool, but the stock prefix search
+        -- still fills the tail: "meiy" (learned 没有钱 under meiyouq) must keep
+        -- 没有 reachable. searchStartWith only returns the FIRST matching code's
+        -- candidates (meiym hides meiyou=没有), so walk every meiy* code; the
+        -- top learned word's own code seeds a targeted walk (meiyouq -> the
+        -- meiyous* range) so 没有 surfaces without wading through every meiy*.
+        addCandi(self:getAllStartsWith(code, 12))
+        if user_matched and user_matched[1] and #user_matched[1].c > #code then
+            addCandi(self:getAllStartsWith(user_matched[1].c:sub(1, #code + 1), 12))
+        end
+        for _, v in ipairs(variants) do
+            addCandi(self:getAllStartsWith(v, 12))
+        end
+        return merged
+    end
+    addCandi(self:getAllStartsWith(code, 12))
     for _, v in ipairs(variants) do
-        addCandi(self:searchStartWith(v))
+        addCandi(self:getAllStartsWith(v, 12))
     end
     return merged
+end
+
+-- imeplus: collect candidates from EVERY stock code starting with `prefix`.
+-- The stock searchStartWith only returns the first matching code's candidates
+-- (binary search stops at meiym, so meiyou=没有 stays hidden behind it); the
+-- sorted index makes the linear walk cheap and we stop after enough candidates.
+function IME:getAllStartsWith(prefix, want)
+    if not prefix or #prefix == 0 then return nil end
+    local out = {}
+    local codes = self.sorted_codes
+    -- binary-search the first code >= prefix
+    local lo, hi = 1, #codes
+    while lo <= hi do
+        local mid = math.floor((lo + hi) / 2)
+        if codes[mid] < prefix then lo = mid + 1 else hi = mid - 1 end
+    end
+    for i = lo, #codes do
+        local code = codes[i]
+        if code:sub(1, #prefix) ~= prefix then break end
+        local candi = self.code_map[code]
+        if candi then
+            if type(candi) == "string" then candi = { candi } end
+            for _, v in ipairs(candi) do
+                out[#out+1] = v
+                if #out >= want then return out end
+            end
+        end
+    end
+    return #out > 0 and out or nil
+end
+
+-- imeplus: words whose full pinyin IS the typed code, promoted above the stock
+-- table order. A word typed often ("chengdu" -> 成都) should outrank the stock
+-- first candidate (程度), not sit behind it. Ranked by usage count; custom
+-- phrases (n=0) come after words the user actually committed.
+function IME:getExactLearned(code)
+    if #code < 2 or #self.user_words == 0 then return nil end
+    -- explicit custom codes ("一闪一闪亮晶晶 ysys") match verbatim
+    local hit = self.custom_codes and self.custom_codes[code]
+    if hit then return { hit.w } end
+    local matched = {}
+    for _, e in ipairs(self.user_words) do
+        if e.c == code then matched[#matched+1] = e end
+    end
+    if #matched == 0 then return nil end
+    table.sort(matched, function(a, b) return a.n > b.n end)
+    local out = {}
+    for i = 1, math.min(#matched, USER_CANDI_MAX) do
+        out[i] = matched[i].w
+    end
+    return out
 end
 
 -- imeplus: learned-word candidates for a typed code, ranked by usage count.
@@ -439,6 +664,16 @@ end
 -- ("zhch"/"zc"/"zhc"/"zch" for "zhichi") already are subsequences of the learned
 -- code, while fuzzy elongation variants ("zh" -> "zhh") would wrongly resurrect
 -- plain first-syllable prefixes as abbreviations.
+-- imeplus: is the typed code a strict prefix of (or equal to) any explicit
+-- custom code? Used to keep digit keys and empty-candidate compositions alive.
+function IME:isCustomCodePrefix(code)
+    if not self.custom_codes or #code == 0 then return false end
+    for c in pairs(self.custom_codes) do
+        if #code <= #c and c:sub(1, #code) == code then return true end
+    end
+    return false
+end
+
 function IME:getUserCandi(code)
     if #code < 2 or #self.user_words == 0 then return nil end
     local matched = {}
@@ -454,33 +689,47 @@ function IME:getUserCandi(code)
                 allowed = false
             end
         end
-        if allowed and looseMatch(code, e.c, self.code_map) then matched[#matched+1] = e end
+        if allowed and (e.c == code -- the full code typed exactly (auto initials)
+            or (not e.explicit and looseMatch(code, e.c, self.code_map))) then
+            matched[#matched+1] = e
+        end
     end
-    if #matched == 0 then return nil end
+    if #matched == 0 then return nil, nil end
     table.sort(matched, function(a, b) return a.n > b.n end)
     local out = {}
     for i = 1, math.min(#matched, USER_CANDI_MAX) do
         out[i] = matched[i].w
     end
-    return out
+    return out, matched
 end
 
 function IME:saveUserWords()
-    if G_reader_settings then
-        G_reader_settings:saveSetting("imeplus_user_words", self.user_words)
+    if not G_reader_settings then return end
+    -- custom phrases (n=0) are reloaded from the file each session; never persist them
+    local learned = {}
+    for _, e in ipairs(self.user_words) do
+        if e.n > 0 then learned[#learned+1] = e end
     end
+    G_reader_settings:saveSetting("imeplus_user_words", learned)
 end
 
 -- imeplus: record a committed word together with the code it was typed under
--- (called from separate(), i.e. on space commit / digit selection / flush)
+-- (called from separate(), i.e. on space commit / digit selection / flush).
+-- CJK, ASCII and mixed words (K8手机壳) all learn; the code must be letters/digits.
 function IME:learnWord(word, code)
     if not isPinyin(self) or not learn_enabled() then return end
+    if not code:match("^[a-z0-9]+$") then return end -- letter/digit codes only
     local chars = util.splitToChars(word)
-    if #chars < 2 then return end -- single chars and empty flushes don't learn
+    if #chars < 2 then return end -- single chars (CJK or ASCII) don't learn
     for _, ch in ipairs(chars) do
-        if ch:byte(1) < 0xE0 then return end -- pure CJK words only
+        local b = ch:byte(1)
+        -- reject chars outside CJK + printable ASCII (Cyrillic, kana...)
+        if not ((b >= 0xE4 and b <= 0xEF) or (b >= 0x20 and b <= 0x7E)) then return end
     end
-    if #code < 2 or #code > 6 * #chars then return end -- plausible full-pinyin length
+    if word:match("[\xE4-\xE9\xEA-\xEF]") then
+        -- word contains CJK: cap the code at a plausible full-pinyin length
+        if #code > 6 * #chars then return end
+    end
     for _, e in ipairs(self.user_words) do
         if e.w == word then
             e.n = e.n + 1
@@ -520,9 +769,10 @@ function IME:getHintChars(inputbox)
     self.on_stage_char_count = 0
     local hint_chars = ""
     for i=1, #_stack do
-        hint_chars = hint_chars .. _stack[i].char
-        if _stack[i].char ~= "" then
-            self.on_stage_char_count = self.on_stage_char_count + #util.splitToChars(_stack[i].char)
+        local ch = _stack[i].char or "" -- 兜底: 任何路径漏守卫也不得 concat-nil 闪退
+        hint_chars = hint_chars .. ch
+        if ch ~= "" then
+            self.on_stage_char_count = self.on_stage_char_count + #util.splitToChars(ch)
         end
     end
     local imex = _stack[#_stack]
@@ -591,18 +841,44 @@ function IME:refreshHintChars(inpuxbox)
     inpuxbox.addChars:raw_method_call(self:getHintChars(inpuxbox))
 end
 
+-- imeplus: "v" mode — typing v then letters emits half-width ASCII verbatim.
+-- The field shows the literal buffer ("vbing"); committing (space / separator /
+-- non-letter) drops the leading "v" and leaves "bing". No candidate stack is
+-- involved, so vterm and stock pinyin behavior are untouched outside v mode.
+function IME:vCommit(inputbox, keep_letters)
+    if not self.v_text then return end
+    local text = self.v_text
+    self.v_text = nil
+    for _ = 1, #text do inputbox.delChar:raw_method_call() end
+    if keep_letters and #text > 1 then
+        inputbox.addChars:raw_method_call(text:sub(2))
+    end
+end
+
+-- imeplus: replace the displayed v-buffer with the new value. The caller must
+-- pass the OLD text length, since the field still shows the previous content.
+function IME:vRefresh(inputbox, old_len)
+    for _ = 1, old_len or 0 do inputbox.delChar:raw_method_call() end
+    inputbox.addChars:raw_method_call(self.v_text or "")
+end
+
 function IME:separate(inputbox)
+    -- imeplus: v-mode commit takes precedence over the candidate stack
+    if self.v_text then
+        self:vCommit(inputbox, true)
+        self:clear_stack()
+        return
+    end
     if self.hint_char_count then
         self:delHintChars(inputbox)
     end
-    -- imeplus: commit point — learn the staged word with the code typed for it
-    if isPinyin(self) and #_stack > 0 then
-        local word, code = "", ""
-        for i = 1, #_stack do
-            word = word .. _stack[i].char
-            code = code .. _stack[i].code
-        end
-        self:learnWord(word, code)
+    -- imeplus: commit point — learn the staged word with the code typed for it.
+    -- Only a SINGLE-frame composition is learned: in the pinyin layout the whole
+    -- syllable sequence lives in one frame, so extra frames mean the composition
+    -- broke mid-word and restarting glued unrelated stage chars together — that
+    -- is how "没有钱没有钱" got learned from a broken two-frame flush.
+    if isPinyin(self) and #_stack == 1 then
+        self:learnWord(_stack[1].char, _stack[1].code)
     end
     self:clear_stack()
 end
@@ -636,6 +912,14 @@ function IME:hasCandidates()
 end
 
 function IME:wrappedDelChar(inputbox)
+    -- imeplus: v-mode backspace removes one buffered letter; emptying cancels
+    if self.v_text then
+        local old_len = #self.v_text
+        self.v_text = self.v_text:sub(1, -2)
+        if self.v_text == "" then self.v_text = nil end
+        self:vRefresh(inputbox, old_len)
+        return
+    end
     local imex = _stack[#_stack]
     -- stepped deletion
     if #imex.code > 1 then
@@ -644,8 +928,11 @@ function IME:wrappedDelChar(inputbox)
         imex.index = 1
         local new_candi, last_candi = self:getCandidates(imex.code)
         self:tweak_case(new_candi, imex)
-        imex.candi, imex.last_candi = new_candi, last_candi
-        imex.char = imex.candi[1]
+        imex.candi, imex.last_candi = new_candi or {}, last_candi
+        -- 自定义词组/自定义编码会让"空候选组词"成为常态(见下方 wrappedAddChars
+        -- 的空结果分支), 回退一步同样可能空: char 必须保持字符串, 否则
+        -- getHintChars 拼 nil → 整个 KOReader 闪退(真机 crash.log 实证)
+        imex.char = imex.candi[1] or ""
         self:refreshHintChars(inputbox)
     elseif #_stack > 1 then
         -- over one chars, last char has only one stroke
@@ -661,6 +948,31 @@ function IME:wrappedDelChar(inputbox)
 end
 
 function IME:wrappedAddChars(inputbox, char, orig_char)
+    -- imeplus: v-mode passthrough (pinyin layout only, idle stack)
+    if isPinyin(self) then
+        if self.v_text then
+            if #char == 1 and char:match("^%a$") then
+                local old_len = #self.v_text
+                self.v_text = self.v_text .. char
+                self:vRefresh(inputbox, old_len)
+                return
+            end
+            -- space / separator / punctuation / digits commit the letters.
+            -- The space only COMMITS — it is not inserted; word gaps are typed
+            -- afterwards (out of v-mode, a plain space lands literally).
+            self:vCommit(inputbox, true)
+            self:clear_stack()
+            if not (char == " " or char == self.separator) then
+                inputbox.addChars:raw_method_call(orig_char or char)
+            end
+            return
+        elseif #char == 1 and char == "v" and #_stack == 1 and _stack[1].code == "" then
+            self.v_text = "v"
+            self:vRefresh(inputbox, 0)
+            return
+        end
+    end
+
     local imex = _stack[#_stack]
     if char == self.switch_char then
         if isPinyin(self) then
@@ -742,9 +1054,21 @@ function IME:wrappedAddChars(inputbox, char, orig_char)
         else
             inputbox.delChar:raw_method_call()
         end
+    elseif isPinyin(self) and #char == 1 and char >= "1" and char <= "9"
+        and #imex.code > 0 and self:isCustomCodePrefix(imex.code .. char) then
+        -- imeplus: a digit that extends a custom-code prefix ("k8sjk" after "k")
+        -- is swallowed into the composition instead of selecting a candidate
+        imex.index = 1
+        local new_candi = self:getCandidates(imex.code .. char)
+        imex.code = imex.code .. char
+        imex.char = new_candi and new_candi[1] or ""
+        imex.candi = new_candi or {}
+        self:refreshHintChars(inputbox)
     elseif isPinyin(self) and #char == 1 and char >= "1" and char <= "9" and #imex.code > 0 then
         -- imeplus: digit key selects the n-th candidate on the current page;
-        -- digits beyond the visible page size commit literally (never a hidden candidate)
+        -- digits beyond the visible page size commit literally (never a hidden
+        -- candidate). A digit that extends a custom-code prefix ("k8sjk" after
+        -- "k") is swallowed into the composition instead.
         local nd = tonumber(char)
         local page_size = visiblePageSize(imex, inputbox)
         local target = imex.index + nd - 1
@@ -776,6 +1100,13 @@ function IME:wrappedAddChars(inputbox, char, orig_char)
                 if self.auto_separate_callback() and self:uniqueMap(imex.code) then
                     self:separate(inputbox)
                 end
+            elseif new_candi and #new_candi == 0 and #_stack == 1 then
+                -- imeplus: empty result (custom-code prefix like "ysy") — keep the
+                -- composition alive instead of restarting from the single letter
+                imex.code = imex.code .. key
+                imex.char = ""
+                imex.candi = {}
+                self:refreshHintChars(inputbox)
             else
                 if self.auto_separate_callback() then -- flush current stack
                     self:separate(inputbox)
