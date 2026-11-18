@@ -1,5 +1,9 @@
 # imeplus.koplugin — 拼音输入增强 / Pinyin IME enhancement for KOReader
 
+> **⚠️ 已停止维护 / DEPRECATED**：本插件已由 [imebar.koplugin（拼音辣条）](https://github.com/eznas/imebar.koplugin) 取代 —— 自带引擎 + 键盘上方候选字条带，可直接替换本插件；两插件同时安装时 imebar 稳定优先。设置数据（`imeplus_*`）与自定义词组不会自动迁移，见 imebar README。
+>
+> **⚠️ DEPRECATED**: superseded by [imebar.koplugin](https://github.com/eznas/imebar.koplugin) — a self-hosted engine plus a full-width candidate strip above the keyboard. Drop-in replacement; when both are installed imebar takes priority.
+
 让 KOReader 内置拼音输入法好用起来：候选带数字编号、数字键选字、←/→ 翻页、模糊拼音、按输入框宽度自适应候选数、记忆常用词（简拼）。
 Makes the built-in KOReader pinyin IME actually usable: numbered candidate window, digit selection, ←/→ paging, fuzzy pinyin, width-aware candidate count, and self-learned abbreviations.
 
